@@ -1,5 +1,6 @@
 __pycache__
 datasets
 models
-cache.db
+cache.db*
 .env
+*.pt

@@ -22,42 +22,6 @@ S3_ENDPOINT = os.getenv("S3_ENDPOINT", "")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "")
 
-"""
-
-    ### Training flow:
-    * save first image for validation
-    * after that use input: validation_save_chance
-        * randomly save images to the validation folder
-
-        $datasets_dir
-            /1
-                /val
-                    /images
-                    /labels
-                /train
-                    /images
-                    /labels
-
-                dataset.yaml
-                full-dataset.yaml
-                12343244.png
-                12342134.txt
-
-    * on train end:
-        move image to train/images
-        move annotation to train/labels
-
-    * models:
-
-        $weights_dir
-            /1
-                ?
-
-        * naming scheme:
-            [original_name]
-
-"""
-
 
 class YOLOv8Model(LabelStudioMLBase):
     def __init__(self, projectId, **kwargs):
@@ -73,16 +37,18 @@ class YOLOv8Model(LabelStudioMLBase):
 
         def on_train_end_cb(trainer):
             print("Training finished")
-            print(trainer)
+            print(trainer.best)
+            self.move_new_weights(trainer.best, trainer.args.name)
 
         self.model.add_callback("on_train_end", on_train_end_cb)
 
-        #
         self.storage_client = Minio(S3_ENDPOINT, access_key=S3_ACCESS_KEY, secret_key=S3_SECRET_KEY)
-
-        self.from_name, self.to_name, self.value, self.labels = get_single_tag_keys(
-            self.parsed_label_config, 'PolygonLabels', 'Image'
-        )
+        try:
+            self.from_name, self.to_name, self.value, self.labels = get_single_tag_keys(
+                self.parsed_label_config, 'PolygonLabels', 'Image'
+            )
+        except TypeError:
+            pass
 
     def predict(self, tasks: List[Dict], context: Optional[Dict] = None, **kwargs) -> List[Dict]:
         # images will only have one task for now (segmatation - polyline
@@ -149,46 +115,55 @@ class YOLOv8Model(LabelStudioMLBase):
         This method is called each time an annotation is created or updated
 
         """
+        print(self.labels)
         print(data)
         if event == 'ANNOTATION_CREATED':
-            pass
+            self.save_annotation(data)
+        elif event == 'ANNOTATION_UPDATED':
+            self.save_annotation(data)
 
-        self.execute_single_image_train(data)
-
-    def execute_single_image_train(self, data):
+    def save_annotation(self, data):
         taskId = data['task']['id']
         print(f"Executing training run for task {taskId} on project [{data['project']['id']}]{data['project']['title']}")
 
-        file_name = self.save_training_image(taskId, urlparse(data['task']['data'][self.value]))
-        self.save_training_labels(taskId, data['annotation'], file_name)
-        self.generate_classes_txt(taskId)
-        self.generate_dataset_yaml(taskId)
+        # decide if image will be used for validation or training
+        training_required = False
+        training_images = get_image_count(os.path.join(self.get_project_dataset_dir(), 'train', 'images'))
+        validation_images = get_image_count(os.path.join(self.get_project_dataset_dir(), 'val', 'images'))
+        total_images = training_images + validation_images
+        if validation_images == 0 or total_images % 10 == 0:
+            path = os.path.join(self.get_project_dataset_dir(), 'val')
+        else:
+            path = os.path.join(self.get_project_dataset_dir(), 'current')
+            training_required = True
 
-        thread = threading.Thread(target=train_model, kwargs={'projectId': self.projectId, 'taskId': taskId})
-        thread.start()
-        print("Training started on new thread")
-
-    def save_training_image(self, taskId, s3url):
+        s3url = urlparse(data['task']['data'][self.value])
         print("Saving task image:", s3url.path)
         response = self.storage_client.get_object(s3url.netloc, s3url.path)
         image = Image.open(response)
-        images_dir = os.path.join(self.get_project_datasets_dir(), str(taskId), 'images')
-        if not os.path.exists(os.path.join(images_dir, 'train')):
-            os.makedirs(os.path.join(images_dir, 'train'))
-        if not os.path.exists(os.path.join(images_dir, 'val')):
-            os.makedirs(os.path.join(images_dir, 'val'))
 
         file = os.path.basename(s3url.path)
-        image.save(os.path.join(images_dir, 'train', file), 'PNG')
+        image.save(os.path.join(os.path.join(path, 'images'), file), 'PNG')
+        file_name, ext = os.path.splitext(file)
 
-        root, ext = os.path.splitext(file)
+        print("Saving annotation")
+        save_to_path(self.polygon_results_tostring(data['annotation']), os.path.join(path, 'labels'), file_name + '.txt')
 
-        return root
+        print("Saving classes.txt")
+        save_to_path('\n'.join(self.parsed_label_config['label']['labels']), self.get_project_dataset_dir(), 'classes.txt')
 
-    def save_polygon_labels_from_result(self, annotation_result, path):
-        print("Processing annotation data")
+        print("Generating dataset.yaml")
+        save_to_path(self.generate_dataset_yaml(), self.get_project_dataset_dir(), 'dataset.yaml')
+        save_to_path(self.generate_full_dataset_yaml(), self.get_project_dataset_dir(), 'dataset-full.yaml')
+        if training_required:
+            thread = threading.Thread(target=train_model, kwargs={'projectId': self.projectId, 'taskId': taskId})
+            thread.start()
+            print("Training started on new thread")
+
+    def polygon_results_tostring(self, annotation_data):
         segm = []
-        for result in annotation_result:
+
+        for result in annotation_data['result']:
             points = np.array(result['value']['points']) / \
                 np.array([result['original_width'], result['original_height']])
 
@@ -198,36 +173,39 @@ class YOLOv8Model(LabelStudioMLBase):
             for label in result['value']['polygonlabels']:
                 segm.append(f"{self.get_label_id(label)} {points_str}")
 
-        if not os.path.exists(path):
-            os.makedirs(path)
+        return '\n'.join(segm)
 
-        with open(os.path.join(labels_dir, 'train', file_name + '.txt'), 'w') as f:
-            f.write('\n'.join(segm))
-
-    def generate_dataset_yaml(self, taskId):
-        print("Generating dataset.yaml")
+    def generate_dataset_yaml(self):
         labels = {}
 
         for index, label in enumerate(self.parsed_label_config['label']['labels']):
             labels[index] = label
 
         dataset = {
-            'path': os.path.join(self.get_project_datasets_dir(), str(taskId)),
-            'train': 'images/train',
-            'val': 'images/val',
+            'path': os.path.join(self.get_project_dataset_dir()),
+            'train': 'current/images',
+            'val': 'val/images',
             'names': labels
         }
 
-        with open(os.path.join(self.get_project_datasets_dir(), str(taskId), 'dataset.yaml'), 'w') as f:
-            f.write(yaml.dump(dataset))
+        return yaml.dump(dataset)
 
-    def generate_classes_txt(self, taskId):
-        print("Generated classes.txt")
-        dataset_dir = os.path.join(self.get_project_datasets_dir(), str(taskId))
-        with open(os.path.join(dataset_dir, 'classes.txt'), 'w') as f:
-            f.write('\n'.join(self.parsed_label_config['label']['labels']))
+    def generate_full_dataset_yaml(self):
+        labels = {}
 
-    def get_project_datasets_dir(self):
+        for index, label in enumerate(self.parsed_label_config['label']['labels']):
+            labels[index] = label
+
+        dataset = {
+            'path': os.path.join(self.get_project_dataset_dir()),
+            'train': 'train/images',
+            'val': 'val/images',
+            'names': labels
+        }
+
+        return yaml.dump(dataset)
+
+    def get_project_dataset_dir(self):
         return os.path.join(os.path.abspath(settings['datasets_dir']), str(self.projectId))
 
     def get_project_runs_dir(self):
@@ -236,20 +214,70 @@ class YOLOv8Model(LabelStudioMLBase):
     def get_project_weights_dir(self):
         return os.path.join(os.path.abspath(settings['weights_dir']), str(self.projectId))
 
+    def get_label_id(self, label):
+        return self.parsed_label_config['label']['labels'].index(label)
+
+    def move_new_weights(self, bestPath, experimentName):
+        currentVersion = self.get('model_version')
+
+        vl = currentVersion.split('.')
+
+        if experimentName.startswith("single"):
+            if len(vl) == 1:
+                vl.append(str(1))
+            else:
+                vl[len(vl) - 1] = str(int(vl[len(vl) - 1]) + 1)  # increment last by 1
+        else:
+            tp = os.path.join(self.get_project_dataset_dir(), 'train', 'images')
+            vl.append(str(get_image_count(tp)))
+            vl.append(str(0))
+
+        newVersion = '.'.join(vl)
+        self.set('model_version', newVersion)
+        os.rename(bestPath, os.path.join(self.get_project_weights_dir(), newVersion + '.pt'))
+        print(f"Model updated to version {newVersion}")
+
 
 def train_model(projectId, taskId):
     backend = YOLOv8Model(projectId)
 
     backend.model.train(
-        data=os.path.join(backend.get_project_datasets_dir(), str(taskId), 'dataset.yaml'),
+        data=os.path.join(backend.get_project_dataset_dir(), 'dataset.yaml'),
         epochs=10,
         project=backend.get_project_runs_dir(),
-        name=f"{str(taskId)}-single",
+        name=f"{str(taskId)}/single",
         mask_ratio=1,
-        overlap_mask=True,
-        val=False
-    )
+        overlap_mask=True)
 
 
-def get_label_id(parsed_label_config, label):
-    return parsed_label_config['label']['labels'].index(label)
+def train_model_full(projectId, epochs):
+    backend = YOLOv8Model(projectId)
+
+    backend.model.train(
+        data=os.path.join(backend.get_project_dataset_dir(), 'dataset-full.yaml'),
+        epochs=epochs,
+        project=backend.get_project_runs_dir(),
+        name='full',
+        mask_ratio=1,
+        overlap_mask=True)
+
+
+def save_to_path(data, path, file):
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+    with open(os.path.join(path, file), 'w') as f:
+        f.write(data)
+
+
+def get_image_count(path):
+    # image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff']
+    image_count = 0
+
+    for root, dirs, files in os.walk(path):
+        for file in files:
+            # if any(file.lower().endswith(ext) for ext in image_extensions):
+            if file.lower().endswith('.png'):
+                image_count += 1
+
+    return image_count
